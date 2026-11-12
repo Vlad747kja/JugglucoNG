@@ -33,9 +33,9 @@ class XdripBackfillTracker(
     private val windowMs: Long = DEFAULT_WINDOW_MS,
 ) {
     /** [storedAtMs]: when the reading first reached the phone; 0 when unknown, taken as late. */
-    data class Candidate(val timeMs: Long, val mgdl: Double, val rate: Float, val storedAtMs: Long = 0L) {
+    data class Candidate(val timeMs: Long, val mgdl: Double, val rate: Float, val storedAtMs: Long = 0L, val retryRequired: Boolean = false) {
         val arrivedLive: Boolean
-            get() = storedAtMs > 0L && storedAtMs - timeMs <= LIVE_ARRIVAL_MS
+            get() = !retryRequired && storedAtMs > 0L && storedAtMs - timeMs <= LIVE_ARRIVAL_MS
     }
 
     data class Sensor(val startWatermarkMs: Long, val sensorGen: Int, val sensorStartMs: Long)
@@ -114,7 +114,7 @@ class XdripBackfillTracker(
      * outside the window or in the future, is at or before the sensor's start watermark, inside a
      * stretch restored as already sent, or within the deduplication distance of something sent:
      * 5/6 of the sample period, or [spacingMs] (the collapse interval) when that is longer. The ones
-     * returned are recorded as sent.
+     * returned are recorded as sent only after [dispatch] accepts them.
      */
     @Synchronized
     fun pick(
@@ -122,6 +122,7 @@ class XdripBackfillTracker(
         batch: List<Candidate>,
         nowMs: Long,
         spacingMs: Long = 0L,
+        dispatch: (Candidate) -> Boolean = { true },
     ): List<Candidate> {
         val state = states[sensorId] ?: return emptyList()
         val sorted = batch.sortedBy(Candidate::timeMs)
@@ -138,8 +139,10 @@ class XdripBackfillTracker(
             if (candidate.arrivedLive) continue
             if (!isDeliverable(state.restored, state.sent, candidate.timeMs, nowMs, dedupMs, lowerBound)) continue
             if (!(candidate.mgdl.isFinite() && candidate.mgdl > 0.0)) continue
-            state.sent.add(candidate.timeMs)
-            picked.add(candidate)
+            if (dispatch(candidate)) {
+                state.sent.add(candidate.timeMs)
+                picked.add(candidate)
+            }
         }
         return picked
     }

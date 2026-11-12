@@ -19,6 +19,27 @@ class XdripBackfillTrackerTests {
     private fun point(minutesAgo: Long, mgdl: Double = 100.0) = at(now - minutesAgo * minute, mgdl)
 
     @Test
+    fun `known live dispatch failure is not treated as already delivered`() {
+        val tracker = XdripBackfillTracker()
+        tracker.restore("S", floor(now - 10 * minute))
+        val row = Candidate(now - minute, 120.0, 1f, storedAtMs = now, retryRequired = true)
+        assertEquals(listOf(row), tracker.pick("S", listOf(row), now, dispatch = { true }))
+        assertTrue(tracker.pick("S", listOf(row), now).isEmpty())
+    }
+
+    @Test
+    fun `failed dispatch remains eligible and only successful retries enter coverage`() {
+        val tracker = XdripBackfillTracker()
+        tracker.restore("S", floor(now - 10 * minute))
+        val batch = listOf(point(5), point(4))
+        assertTrue(tracker.pick("S", batch, now, dispatch = { false }).isEmpty())
+        assertTrue(tracker.needsBackfill("S", batch, now))
+        assertEquals(listOf(point(5)), tracker.pick("S", batch, now, dispatch = { it.timeMs == point(5).timeMs }))
+        assertEquals(listOf(point(4)), tracker.pick("S", batch, now, dispatch = { true }))
+        assertTrue(tracker.pick("S", batch, now).isEmpty())
+    }
+
+    @Test
     fun `gap before the first live send after a restart is backfilled in order`() {
         val tracker = XdripBackfillTracker()
         tracker.restore("S", floor(now - 40 * minute))

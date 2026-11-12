@@ -54,6 +54,21 @@ object XdripBackfill {
         persist(id)
     }
 
+    @JvmStatic
+    fun onLiveSendFailed(sensorId: String?, timeMs: Long, mgdl: Double, rate: Float, sensorGen: Int, sensorStartMs: Long) {
+        if (sensorId.isNullOrEmpty() || timeMs <= 0 || !mgdl.isFinite() || mgdl <= 0) return
+        val id = key(sensorId)
+        if (tracker.sensor(id) == null && restore(id) == null)
+            tracker.restore(id, XdripBackfillTracker.Coverage(timeMs - 1, sensorGen, sensorStartMs, emptyList()))
+        val schedule = synchronized(pending) {
+            val queued = pending.getOrPut(id) { Pending(sensorId) }
+            val first = queued.candidates.isEmpty()
+            queued.candidates[timeMs] = XdripBackfillTracker.Candidate(timeMs, mgdl, rate, retryRequired = true)
+            first
+        }
+        if (schedule) Applic.scheduler.schedule({ flush(id) }, PROCESS_DELAY_MS, TimeUnit.MILLISECONDS)
+    }
+
     /**
      * History rows for [sensorSerial] were written. The ones live never carried are sent
      * [PROCESS_DELAY_MS] later: the history row of a reading is stored just before that reading
@@ -76,7 +91,10 @@ object XdripBackfill {
             val schedule = synchronized(pending) {
                 val queued = pending.getOrPut(id) { Pending(sensorSerial) }
                 val first = queued.candidates.isEmpty()
-                computed.forEach { queued.candidates[it.timeMs] = it }
+                computed.forEach { point ->
+                    val retry = queued.candidates[point.timeMs]?.retryRequired == true
+                    queued.candidates[point.timeMs] = if (retry) point.copy(retryRequired = true) else point
+                }
                 first
             }
             if (schedule) {
@@ -121,7 +139,7 @@ object XdripBackfill {
         candidates(sensorSerial, rows, viewMode, smoothingMinutes, causalHistory)
             .map { DisplayedRow(it.timeMs, Math.round(it.mgdl).toInt()) }
 
-    private fun flush(id: String) {
+    private fun flush(id: String, attempt: Int = 0) {
         try {
             val queued = synchronized(pending) { pending.remove(id) } ?: return
             // The user may have picked another sensor during the delay.
@@ -129,13 +147,21 @@ object XdripBackfill {
             val app = Applic.app ?: return
             val sensor = tracker.sensor(id) ?: return
             val spacingMs = DataSmoothing.exchangeThrottleIntervalMinutes(app) * 60_000L
-            val picked = tracker.pick(id, queued.candidates.values.toList(), System.currentTimeMillis(), spacingMs)
-            if (picked.isEmpty()) return
-            if (Log.doLog) Log.i(LOG_ID, "backfill ${picked.size} readings sensor=$id")
-            for (point in picked) {
+            val failed = ArrayList<XdripBackfillTracker.Candidate>()
+            tracker.pick(id, queued.candidates.values.toList(), System.currentTimeMillis(), spacingMs) { point ->
                 SendLikexDrip.broadcastBackfill(id, sensor.sensorGen, point.mgdl, point.timeMs, point.rate, sensor.sensorStartMs)
+                    .also { if (!it) failed.add(point) }
             }
             persist(id)
+            if (failed.isNotEmpty() && attempt < 3) {
+                val schedule = synchronized(pending) {
+                    val retry = pending.getOrPut(id) { Pending(queued.sensorSerial) }
+                    val first = retry.candidates.isEmpty()
+                    failed.forEach { retry.candidates[it.timeMs] = it.copy(retryRequired = true) }
+                    first
+                }
+                if (schedule) Applic.scheduler.schedule({ flush(id, attempt + 1) }, PROCESS_DELAY_MS, TimeUnit.MILLISECONDS)
+            }
         } catch (error: Throwable) {
             Log.stack(LOG_ID, "flush", error)
         }

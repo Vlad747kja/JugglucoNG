@@ -38,6 +38,7 @@ public class SendLikexDrip   {
 private static final String EXTRA_SENSOR_STARTED_AT = "com.eveningoutpost.dexdrip.Extras.SensorStartedAt";
     private static final String EXTRA_TIMESTAMP = "com.eveningoutpost.dexdrip.Extras.Time";
    private static final String EXTRA_DATA_SOURCE_INFO = "com.eveningoutpost.dexdrip.Extras.SourceInfo";
+private static final String EXTRA_RAW = "com.eveningoutpost.dexdrip.Extras.Raw";
 private static final String LOG_ID="SendLikexDrip";
 /*
 private static int getBatteryLevel() { 
@@ -62,6 +63,9 @@ private static int getBatteryLevel() {
 private static Bundle mkGlucosebundle(ExchangeGlucosePayload payload,long sensorStartmsec) {
     Bundle extras = new Bundle();
     extras.putDouble(EXTRA_BG_ESTIMATE,payload.primaryMgdl);
+    // This is already resolved/calibrated upstream. AAPS AutoISF treats a nonzero Raw
+    // extra as processed xDrip input and must not calibrate it a second time.
+    extras.putDouble(EXTRA_RAW,payload.primaryMgdl);
     extras.putString(EXTRA_BG_SLOPE_NAME,payload.trendName);
 
     extras.putDouble(EXTRA_BG_SLOPE,(double)payload.trendRate/60000.0);
@@ -72,45 +76,45 @@ private static Bundle mkGlucosebundle(ExchangeGlucosePayload payload,long sensor
     return extras;
       }
 
-private static String[] names=null;
+private static volatile String[] names=null;
 public static  void setreceivers() {
-    names=Natives.xdripRecepters();
+    final String[] configured = Natives.xdripRecepters();
+    names = configured == null ? null : configured.clone();
     }
-static void broadcastglucose(ExchangeGlucosePayload payload,long sensorStartmsec) {
-    if(names==null)
-        return;
+static boolean broadcastglucose(ExchangeGlucosePayload payload,long sensorStartmsec) {
+    if(payload == null || payload.primaryMgdl <= 0 || payload.timeMillis <= 0) return false;
     {
     if(doLog) {Log.i(LOG_ID,"broadcastglucose "+payload.primaryMgdl+" sensor="+payload.sensorId);};};
-    send(mkGlucosebundle(payload, sensorStartmsec));
+    return send(mkGlucosebundle(payload, sensorStartmsec));
     }
 
 /** A reading that was missed live (history backfill), sent under its own timestamp like xDrip does. */
-public static void broadcastBackfill(String sensorId,int sensorGen,double mgdl,long timeMillis,float rateMgdlPerMinute,long sensorStartmsec) {
-    if(names==null)
-        return;
+public static boolean broadcastBackfill(String sensorId,int sensorGen,double mgdl,long timeMillis,float rateMgdlPerMinute,long sensorStartmsec) {
+    if(!Double.isFinite(mgdl) || mgdl <= 0 || timeMillis <= 0) return false;
     final ExchangeTrend trend=ExchangeTrend.fromRate(rateMgdlPerMinute);
     Bundle extras = new Bundle();
     extras.putDouble(EXTRA_BG_ESTIMATE,mgdl);
+    extras.putDouble(EXTRA_RAW,mgdl);
     extras.putString(EXTRA_BG_SLOPE_NAME,trend.name);
     extras.putDouble(EXTRA_BG_SLOPE,(double)trend.rateMgdlPerMinute/60000.0);
     extras.putLong(EXTRA_TIMESTAMP,timeMillis);
     extras.putLong(EXTRA_SENSOR_STARTED_AT,sensorStartmsec);
     extras.putString(EXTRA_DATA_SOURCE_INFO, SensorSourceResolver.resolveXdripSourceInfo(sensorId, sensorGen));
-    send(extras);
+    return send(extras);
     }
 
-private static void send(Bundle extras) {
+private static boolean send(Bundle extras) {
     final Context context=Applic.app;
-    Intent intent = new Intent(ACTION);
-    intent.putExtras(extras);
-    intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
-    for(var name:names) {
-        if(name!=null) {
-            intent.setPackage(name);
-            context.sendBroadcast(intent);
-            {if(doLog) {Log.i(LOG_ID,name);};};
-            }
-       }
+    final String[] receivers = names;
+    if(context == null || receivers == null || receivers.length == 0) return false;
+    return BroadcastDispatch.all(receivers, name -> {
+        Intent intent = new Intent(ACTION);
+        intent.putExtras(extras);
+        intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+        intent.setPackage(name);
+        context.sendBroadcast(intent);
+        if(doLog) Log.i(LOG_ID,name);
+    }, (name, error) -> Log.stack(LOG_ID, "send to " + name, error));
     }
     
 }
